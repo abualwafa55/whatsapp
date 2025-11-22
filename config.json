@@ -1,0 +1,39 @@
+{
+  "app_name": "WhatsApp Manager",
+  "version": "1.0.0",
+  "description": "WhatsApp Desktop Manager",
+  "author": "ABUALWAFA ALMUGRABI & ASHRAF ABUSALAM",
+  
+  "api": {
+    "base_url": "http://localhost:3000/api",
+    "timeout": 10,
+    "retry_attempts": 3
+  },
+  
+  "ui": {
+    "window_size": "900x700",
+    "theme_color": "#128C7E",
+    "accent_color": "#25D366",
+    "font_family": "Arial",
+    "font_size": 10
+  },
+  
+  "server": {
+    "auto_start": true,
+    "port": 3000,
+    "max_reconnect_attempts": 3,
+    "reconnect_delay": 5000
+  },
+  
+  "session": {
+    "default_name": "my-session",
+    "storage_path": "./baileys-server/sessions",
+    "qr_timeout": 60
+  },
+  
+  "logging": {
+    "enabled": true,
+    "level": "INFO",
+    "max_lines": 1000
+  }
+}

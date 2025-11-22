@@ -1,0 +1,13 @@
+# 1. تثبيت Python Dependencies
+pip install -r requirements.txt
+
+# 2. تثبيت Baileys Server
+mkdir baileys-server
+cd baileys-server
+npm init -y
+npm install @whiskeysockets/baileys express
+
+# 3. نسخ server.js من الـ Artifact الأول
+
+# 4. تشغيل التطبيق
+python whatsapp_app.py
