@@ -1,25 +1,35 @@
 @echo off
 chcp 65001 > nul
+setlocal
 echo ========================================
-echo Update WhatsApp Manager
+echo Update WhatsApp Web Dashboard
 echo ========================================
 echo.
 
-echo Installing Python packages...
-pip install Pillow requests qrcode pyinstaller
+echo 🔄 Updating Baileys server dependencies...
+pushd baileys-server
+call npm install
+if errorlevel 1 (
+	popd
+	echo ❌ Failed to update server dependencies
+	pause
+	exit /b 1
+)
+popd
 
 echo.
-echo Installing Node.js packages...
-cd baileys-server
-npm install qrcode
-cd ..
+echo 🔄 Updating web client dependencies...
+pushd web-client
+call npm install
+if errorlevel 1 (
+	popd
+	echo ❌ Failed to update web client dependencies
+	pause
+	exit /b 1
+)
+popd
 
 echo.
-echo ✅ Update complete!
-echo.
-echo New Features:
-echo - QR Code now shows as image in the app
-echo - No more CMD window needed
-echo - Better user experience
+echo ✅ Update complete! You can now run .\run.bat
 echo.
 pause

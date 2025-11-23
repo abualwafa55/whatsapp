@@ -1,25 +1,12 @@
 @echo off
 chcp 65001 > nul
-title WhatsApp Manager
+title WhatsApp Manager Launcher
 
-REM Check if server is running
-tasklist /FI "WINDOWTITLE eq Baileys Server*" 2>NUL | find /I /N "cmd.exe">NUL
-if "%ERRORLEVEL%"=="0" (
-    echo Server is already running...
-) else (
-    echo Starting Baileys Server...
-    cd baileys-server
-    start "Baileys Server" /MIN cmd /k node server.js
-    cd ..
-    timeout /t 3 /nobreak >nul
+if not exist run.bat (
+    echo ❌ لم يتم العثور على run.bat
+    pause
+    exit /b 1
 )
 
-REM Launch the app
-if exist "WhatsApp-Manager.exe" (
-    start "" "WhatsApp-Manager.exe"
-) else (
-    echo Starting Python version...
-    python whatsapp_app.py
-)
-
-exit
+echo 🚀 تشغيل لوحة الويب الجديدة...
+call run.bat

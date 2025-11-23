@@ -1,66 +1,60 @@
 @echo off
 chcp 65001 > nul
+setlocal
 echo ========================================
-echo Install WhatsApp Desktop App
+echo Install WhatsApp Web Dashboard
 echo ========================================
 echo.
-
-REM Check Python
-echo [1/4] Checking Python...
-python --version > nul 2>&1
-if errorlevel 1 (
-    echo ❌ Python not installed!
-    echo Please install Python from: https://www.python.org/downloads/
-    pause
-    exit /b 1
-)
-echo ✅ Python installed
 
 REM Check Node.js
-echo.
-echo [2/4] Checking Node.js...
+echo [1/3] Checking Node.js...
 node --version > nul 2>&1
 if errorlevel 1 (
     echo ❌ Node.js not installed!
-    echo Please install Node.js from: https://nodejs.org/
+    echo Please install Node.js 20.19+ or 22.12+ from https://nodejs.org/
     pause
     exit /b 1
 )
-echo ✅ Node.js installed
+for /f "tokens=*" %%v in ('node --version') do set NODE_VER=%%v
+echo ✅ Using Node %NODE_VER%
 
-REM Install Python libraries
+REM Install Baileys server dependencies
 echo.
-echo [3/4] Installing Python libraries...
-python -m pip install --upgrade pip >nul 2>&1
-pip install requests Pillow qrcode
-if errorlevel 1 (
-    echo ❌ Failed to install Python libraries
-    pause
-    exit /b 1
-)
-echo ✅ Python libraries installed
-
-REM Setup Baileys Server
-echo.
-echo [4/4] Setting up Baileys Server...
+echo [2/3] Installing API server packages...
 if not exist baileys-server (
-    echo ⚠️ baileys-server folder not found
-    echo You need to create baileys-server folder and its files manually
-    echo Check README.md for details
+    echo ❌ Directory baileys-server غير موجود
     pause
-) else (
-    cd baileys-server
-    echo Installing Node.js packages...
-    call npm install
-    if errorlevel 1 (
-        echo ❌ Failed to install Node.js packages
-        cd ..
-        pause
-        exit /b 1
-    )
-    cd ..
-    echo ✅ Baileys Server setup complete
+    exit /b 1
 )
+pushd baileys-server
+call npm install
+if errorlevel 1 (
+    popd
+    echo ❌ Failed to install server packages
+    pause
+    exit /b 1
+)
+popd
+echo ✅ Server ready
+
+REM Install web client dependencies
+echo.
+echo [3/3] Installing web client packages...
+if not exist web-client (
+    echo ❌ Directory web-client غير موجود
+    pause
+    exit /b 1
+)
+pushd web-client
+call npm install
+if errorlevel 1 (
+    popd
+    echo ❌ Failed to install web client packages
+    pause
+    exit /b 1
+)
+popd
+echo ✅ Web client ready
 
 echo.
 echo ========================================
@@ -68,6 +62,6 @@ echo ✅ Installation completed successfully!
 echo ========================================
 echo.
 echo To run the app, use:
-echo    .\run.bat
+echo    .\run.bat   ^(يشغل السيرفر والواجهة^)
 echo.
 pause

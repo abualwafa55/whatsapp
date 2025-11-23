@@ -1,52 +1,69 @@
 @echo off
 chcp 65001 > nul
+setlocal
 echo ========================================
-echo Run WhatsApp Desktop App
+echo Run WhatsApp Web Dashboard
 echo ========================================
 echo.
 
-REM Check baileys-server exists
+REM Ensure directories exist
 if not exist baileys-server (
-    echo ❌ baileys-server folder not found!
-    echo Please create Baileys Server first
+    echo ❌ Missing folder: baileys-server
     pause
     exit /b 1
 )
 
-REM Check node_modules exists
+if not exist web-client (
+    echo ❌ Missing folder: web-client
+    pause
+    exit /b 1
+)
+
+REM Ensure server dependencies
 if not exist baileys-server\node_modules (
-    echo ❌ Node.js packages not installed!
-    echo Run setup.bat first
-    pause
-    exit /b 1
+    echo Installing server dependencies...
+    pushd baileys-server
+    call npm install
+    if errorlevel 1 (
+        popd
+        echo ❌ Failed to install server dependencies
+        pause
+        exit /b 1
+    )
+    popd
 )
 
-echo [1/2] Starting Baileys Server in background...
-cd baileys-server
-start "Baileys Server" cmd /k node server.js
-cd ..
+REM Ensure client dependencies
+if not exist web-client\node_modules (
+    echo Installing web client dependencies...
+    pushd web-client
+    call npm install
+    if errorlevel 1 (
+        popd
+        echo ❌ Failed to install web client dependencies
+        pause
+        exit /b 1
+    )
+    popd
+)
 
-echo ⏳ Waiting for server to start...
+echo [1/2] Starting Baileys API server...
+pushd baileys-server
+start "Baileys Server" cmd /k npm start
+popd
+
+echo ⏳ Waiting for server to warm up...
 timeout /t 5 /nobreak > nul
 
-REM Check if server is running
-echo 🔍 Checking server connection...
-curl -s http://localhost:3000/ > nul 2>&1
-if errorlevel 1 (
-    echo ⚠️ Server may need more time to start
-    timeout /t 5 /nobreak > nul
-)
-
-echo ✅ Baileys Server ready
+echo [2/2] Starting web client (Vite)...
+pushd web-client
+start "Web Client" cmd /k npm run dev
+popd
 
 echo.
-echo [2/2] Starting Python app...
-python whatsapp_app.py
-
+echo ✅ كل شيء يعمل الآن.
+echo افتح المتصفح على: http://localhost:5173/
 echo.
+echo لإيقاف التشغيل أغلق نوافذ "Baileys Server" و "Web Client" يدويًا.
 echo.
-echo Closing application...
-echo Press any key to close Baileys Server too
-pause > nul
-taskkill /F /FI "WindowTitle eq Baileys Server*" > nul 2>&1
-echo ✅ All processes closed
+pause

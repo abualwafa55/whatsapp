@@ -1,10 +1,23 @@
 import express from 'express';
+import cors from 'cors';
 import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import qrcodeLib from 'qrcode';
 import P from 'pino';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const app = express();
 app.use(express.json());
+const ALLOWED_ORIGINS = (process.env.CLIENT_ORIGIN || 'http://localhost:5173')
+    .split(',')
+    .map(origin => origin.trim());
+app.use(cors({ origin: ALLOWED_ORIGINS }));
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const clientDistPath = path.resolve(__dirname, '../web-client/dist');
+const hasClientBuild = fs.existsSync(clientDistPath);
 
 // Store active sessions
 const sessions = new Map();
@@ -129,9 +142,16 @@ async function createSession(sessionId) {
  * API Endpoints
  */
 
-// Home page
-app.get('/', (req, res) => {
-    res.json({
+// Home page / static UI
+app.get('/', (req, res, next) => {
+    if (hasClientBuild) {
+        const indexPath = path.join(clientDistPath, 'index.html');
+        if (fs.existsSync(indexPath)) {
+            return res.sendFile(indexPath);
+        }
+    }
+
+    return res.json({
         status: 'running',
         message: 'WhatsApp Baileys API Server',
         version: '1.0.0',
@@ -278,6 +298,21 @@ app.delete('/api/session/:sessionId', async (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
+
+if (hasClientBuild) {
+    app.use(express.static(clientDistPath));
+    app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api')) {
+            return next();
+        }
+        const indexPath = path.join(clientDistPath, 'index.html');
+        if (fs.existsSync(indexPath)) {
+            return res.sendFile(indexPath);
+        }
+        return next();
+    });
+}
+
 app.listen(PORT, () => {
     console.log(`
     ╔════════════════════════════════════════╗

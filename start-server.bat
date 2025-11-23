@@ -22,4 +22,4 @@ if not exist baileys-server\node_modules (
 cd baileys-server
 echo 🚀 Starting server on port 3000...
 echo.
-node server.js
+npm start

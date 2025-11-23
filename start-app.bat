@@ -1,12 +1,31 @@
 @echo off
 chcp 65001 > nul
 echo ========================================
-echo Start Python App Only
+echo Start Web Client Only
 echo ========================================
 echo.
 
-echo ⚠️ Make sure Baileys Server is running first!
-echo    If not running, execute: start-server.bat
+if not exist web-client (
+	echo ❌ web-client folder not found!
+	pause
+	exit /b 1
+)
+
+if not exist web-client\node_modules (
+	echo Installing npm packages...
+	pushd web-client
+	call npm install
+	if errorlevel 1 (
+		popd
+		echo ❌ Failed to install npm packages
+		pause
+		exit /b 1
+	)
+	popd
+)
+
+echo ⚠️ تأكد من تشغيل السيرفر عبر start-server.bat أولاً
 echo.
-timeout /t 3 /nobreak
-python whatsapp_app.py
+pushd web-client
+npm run dev
+popd
