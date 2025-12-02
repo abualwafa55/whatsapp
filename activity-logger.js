@@ -1,20 +1,53 @@
-const fs = require('fs').promises;
+const fs = require('fs');
+const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
+const prisma = require('./prismaClient');
 
 class ActivityLogger {
     constructor(encryptionKey) {
         this.logsDir = path.join(__dirname, 'activity_logs');
         this.encryptionKey = encryptionKey;
-        this.maxLogsPerFile = 1000;
-        this.ensureLogsDir();
+        this.userCache = new Map();
+        this.migrationPromise = this.migrateLegacyLogs();
     }
 
-    async ensureLogsDir() {
+    async ensureReady() {
+        if (this.migrationPromise) {
+            await this.migrationPromise;
+            this.migrationPromise = null;
+        }
+    }
+
+    async migrateLegacyLogs() {
+        if (!this.encryptionKey) {
+            return;
+        }
+
         try {
-            await fs.mkdir(this.logsDir, { recursive: true });
+            await fsp.mkdir(this.logsDir, { recursive: true });
+            const files = await fsp.readdir(this.logsDir);
+            const encFiles = files.filter((file) => file.startsWith('activities_') && file.endsWith('.enc'));
+
+            for (const file of encFiles) {
+                const filePath = path.join(this.logsDir, file);
+                try {
+                    const encryptedData = await fsp.readFile(filePath, 'utf8');
+                    if (!encryptedData) continue;
+                    const decryptedData = this.decrypt(encryptedData);
+                    const logs = JSON.parse(decryptedData);
+
+                    for (const log of logs) {
+                        await this.persistActivity(log, { skipEnsure: true });
+                    }
+
+                    await fsp.rename(filePath, `${filePath}.bak`);
+                } catch (error) {
+                    console.error(`Failed to migrate legacy activity log ${file}:`, error.message);
+                }
+            }
         } catch (error) {
-            console.error('Failed to create logs directory:', error);
+            console.error('Failed to migrate legacy activity logs:', error.message);
         }
     }
 
@@ -22,81 +55,89 @@ class ActivityLogger {
         const algorithm = 'aes-256-cbc';
         const key = Buffer.from(this.encryptionKey.slice(0, 64), 'hex');
         const iv = crypto.randomBytes(16);
-        
+
         const cipher = crypto.createCipheriv(algorithm, key, iv);
         let encrypted = cipher.update(text, 'utf8', 'hex');
         encrypted += cipher.final('hex');
-        
+
         return iv.toString('hex') + ':' + encrypted;
     }
 
     decrypt(text) {
         const algorithm = 'aes-256-cbc';
         const key = Buffer.from(this.encryptionKey.slice(0, 64), 'hex');
-        
+
         const parts = text.split(':');
         const iv = Buffer.from(parts[0], 'hex');
         const encryptedText = parts[1];
-        
+
         const decipher = crypto.createDecipheriv(algorithm, key, iv);
         let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
         decrypted += decipher.final('utf8');
-        
+
         return decrypted;
     }
 
-    async logActivity({
-        userEmail,
-        action,
-        resource,
-        resourceId,
-        details,
-        ip,
-        userAgent,
-        success = true
-    }) {
+    async resolveUserId(email) {
+        if (!email) return null;
+        const normalized = email.toLowerCase();
+        if (this.userCache.has(normalized)) {
+            return this.userCache.get(normalized);
+        }
+        const user = await prisma.user.findUnique({ where: { email: normalized } });
+        const userId = user ? user.id : null;
+        this.userCache.set(normalized, userId);
+        return userId;
+    }
+
+    formatActivity(record) {
+        if (!record) return null;
+        return {
+            id: record.id.toString(),
+            timestamp: record.timestamp.toISOString(),
+            userEmail: record.userEmail || null,
+            action: record.action,
+            resource: record.resourceType,
+            resourceId: record.resourceId,
+            details: record.details,
+            ip: record.ip,
+            userAgent: record.userAgent,
+            success: record.success
+        };
+    }
+
+    async persistActivity(activity, { skipEnsure = false } = {}) {
+        if (!skipEnsure) {
+            await this.ensureReady();
+        }
+
+        const userId = await this.resolveUserId(activity.userEmail);
+
+        const record = await prisma.activityLog.create({
+            data: {
+                timestamp: activity.timestamp ? new Date(activity.timestamp) : undefined,
+                userEmail: activity.userEmail || null,
+                action: activity.action,
+                resourceType: activity.resource,
+                resourceId: activity.resourceId,
+                details: activity.details || {},
+                ip: activity.ip,
+                userAgent: activity.userAgent,
+                success: activity.success !== false,
+                userId: userId || undefined
+            }
+        });
+
+        return this.formatActivity(record);
+    }
+
+    async logActivity(entry) {
         const activity = {
             id: crypto.randomUUID(),
             timestamp: new Date().toISOString(),
-            userEmail,
-            action,
-            resource,
-            resourceId,
-            details,
-            ip,
-            userAgent,
-            success
+            ...entry
         };
-
-        // Get today's log file
-        const today = new Date().toISOString().split('T')[0];
-        const logFile = path.join(this.logsDir, `activities_${today}.enc`);
-
-        try {
-            // Read existing logs
-            let logs = [];
-            try {
-                const encryptedData = await fs.readFile(logFile, 'utf8');
-                const decryptedData = this.decrypt(encryptedData);
-                logs = JSON.parse(decryptedData);
-            } catch (error) {
-                // File doesn't exist yet, start fresh
-                logs = [];
-            }
-
-            // Add new activity
-            logs.push(activity);
-
-            // Save back
-            const jsonData = JSON.stringify(logs);
-            const encryptedData = this.encrypt(jsonData);
-            await fs.writeFile(logFile, encryptedData);
-
-        } catch (error) {
-            console.error('Failed to log activity:', error);
-        }
-
-        return activity;
+        return this.persistActivity(activity);
     }
 
     async getActivities({
@@ -105,49 +146,49 @@ class ActivityLogger {
         endDate = null,
         action = null,
         resource = null,
+        resourceId = null,
         limit = 100
     } = {}) {
-        const activities = [];
+        await this.ensureReady();
 
-        try {
-            // Get list of log files
-            const files = await fs.readdir(this.logsDir);
-            const logFiles = files
-                .filter(f => f.startsWith('activities_') && f.endsWith('.enc'))
-                .sort()
-                .reverse(); // Most recent first
-
-            for (const file of logFiles) {
-                try {
-                    const filePath = path.join(this.logsDir, file);
-                    const encryptedData = await fs.readFile(filePath, 'utf8');
-                    const decryptedData = this.decrypt(encryptedData);
-                    const logs = JSON.parse(decryptedData);
-
-                    for (const log of logs.reverse()) {
-                        // Apply filters
-                        if (userEmail && log.userEmail !== userEmail) continue;
-                        if (action && log.action !== action) continue;
-                        if (resource && log.resource !== resource) continue;
-                        
-                        if (startDate && new Date(log.timestamp) < new Date(startDate)) continue;
-                        if (endDate && new Date(log.timestamp) > new Date(endDate)) continue;
-
-                        activities.push(log);
-                        
-                        if (activities.length >= limit) {
-                            return activities;
-                        }
-                    }
-                } catch (error) {
-                    console.error(`Failed to read log file ${file}:`, error);
-                }
-            }
-        } catch (error) {
-            console.error('Failed to get activities:', error);
+        const where = {};
+        if (userEmail) {
+            where.userEmail = userEmail;
+        }
+        if (action) {
+            where.action = action;
+        }
+        if (resource) {
+            where.resourceType = resource;
+        }
+        if (resourceId) {
+            where.resourceId = resourceId;
+        }
+        if (startDate || endDate) {
+            where.timestamp = {};
+            if (startDate) where.timestamp.gte = new Date(startDate);
+            if (endDate) where.timestamp.lte = new Date(endDate);
         }
 
-        return activities;
+        const records = await prisma.activityLog.findMany({
+            where,
+            orderBy: { timestamp: 'desc' },
+            take: limit
+        });
+
+        return records.map((record) => this.formatActivity(record));
+    }
+
+    async getUserActivities(userEmail, limit = 50) {
+        return this.getActivities({ userEmail, limit });
+    }
+
+    async getSessionActivities(sessionId, limit = 50) {
+        return this.getActivities({
+            resource: 'session',
+            resourceId: sessionId,
+            limit
+        });
     }
 
     async getUserActivities(userEmail, limit = 50) {

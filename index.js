@@ -46,7 +46,8 @@ const axios = require('axios');
 const { initializeApi, apiToken, getWebhookUrl } = require('./api_v1');
 const { initializeLegacyApi } = require('./legacy_api');
 const { randomUUID } = require('crypto');
-const crypto = require('crypto'); // Add crypto for encryption
+const crypto = require('crypto');
+const prisma = require('./prismaClient');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 require('dotenv').config();
@@ -58,16 +59,19 @@ const ActivityLogger = require('./activity-logger');
 const sessions = new Map();
 const retries = new Map();
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+
+// Increase max header size to prevent 431 errors
+const server = http.createServer({
+    maxHeaderSize: 1048576 // 1MB (Increased from 64KB)
+}, app);
+
+const wss = new WebSocketServer({ noServer: true });
 
 // Track WebSocket connections with their associated users
 const wsClients = new Map(); // Maps WebSocket client to user info
 
 const logger = pino({ level: 'debug' });
 
-const TOKENS_FILE = path.join(__dirname, 'session_tokens.json');
-const ENCRYPTED_TOKENS_FILE = path.join(__dirname, 'session_tokens.enc');
 let sessionTokens = new Map();
 
 // Encryption key - MUST be stored in .env file
@@ -100,90 +104,101 @@ const TRUST_PROXY_SETTING = normalizeTrustProxy(process.env.TRUST_PROXY);
 const userManager = new UserManager(ENCRYPTION_KEY);
 const activityLogger = new ActivityLogger(ENCRYPTION_KEY);
 
-// Encryption functions
-function encrypt(text) {
-    const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(ENCRYPTION_KEY.slice(0, 64), 'hex');
-    const iv = crypto.randomBytes(16);
-    
-    const cipher = crypto.createCipheriv(algorithm, key, iv);
-    let encrypted = cipher.update(text, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    
-    return iv.toString('hex') + ':' + encrypted;
+function mapSessionRecord(record) {
+    if (!record) {
+        return null;
+    }
+
+    return {
+        sessionId: record.id,
+        status: record.status,
+        detail: record.detail,
+        qr: record.qr,
+        reason: record.reason,
+        owner: record.owner?.email || null,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt
+    };
 }
 
-function decrypt(text) {
-    const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(ENCRYPTION_KEY.slice(0, 64), 'hex');
-    
-    const parts = text.split(':');
-    const iv = Buffer.from(parts[0], 'hex');
-    const encryptedText = parts[1];
-    
-    const decipher = crypto.createDecipheriv(algorithm, key, iv);
-    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    
-    return decrypted;
-}
-
-// Enhanced token management with encryption
-function saveTokens() {
+async function loadSessionTokensFromDb() {
     try {
-        const tokensToSave = Object.fromEntries(sessionTokens);
-        const jsonString = JSON.stringify(tokensToSave, null, 2);
-        const encrypted = encrypt(jsonString);
-        
-        fs.writeFileSync(ENCRYPTED_TOKENS_FILE, encrypted, 'utf-8');
-        
-        // Set file permissions (read/write for owner only)
-        if (process.platform !== 'win32') {
-            fs.chmodSync(ENCRYPTED_TOKENS_FILE, 0o600);
+        const records = await prisma.sessionToken.findMany();
+        sessionTokens.clear();
+        for (const record of records) {
+            sessionTokens.set(record.sessionId, record.tokenValue);
         }
-        
-        // Keep backward compatibility - save plain JSON but with warning
-        if (fs.existsSync(TOKENS_FILE)) {
-            fs.unlinkSync(TOKENS_FILE); // Remove old plain file
-        }
+        console.log(`🔐 Loaded ${records.length} session token(s) from MySQL.`);
     } catch (error) {
-        console.error('Error saving encrypted tokens:', error);
+        console.error('Error loading session tokens from database:', error);
     }
 }
 
-function loadTokens() {
+async function loadSessionsFromDb() {
     try {
-        // Try to load encrypted file first
-        if (fs.existsSync(ENCRYPTED_TOKENS_FILE)) {
-            const encrypted = fs.readFileSync(ENCRYPTED_TOKENS_FILE, 'utf-8');
-            const decrypted = decrypt(encrypted);
-            const tokensFromFile = JSON.parse(decrypted);
-            
-            sessionTokens.clear();
-            for (const [key, value] of Object.entries(tokensFromFile)) {
-                sessionTokens.set(key, value);
+        const records = await prisma.session.findMany({
+            include: {
+                owner: {
+                    select: { email: true }
+                }
+            },
+            orderBy: { createdAt: 'asc' }
+        });
+        sessions.clear();
+        for (const record of records) {
+            const snapshot = mapSessionRecord(record);
+            if (snapshot) {
+                sessions.set(record.id, snapshot);
             }
-            return;
         }
-        
-        // Fallback: migrate from old plain JSON file
-        if (fs.existsSync(TOKENS_FILE)) {
-            console.log('📦 Migrating plain tokens to encrypted format...');
-            const tokensFromFile = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf-8'));
-            
-            sessionTokens.clear();
-            for (const [key, value] of Object.entries(tokensFromFile)) {
-                sessionTokens.set(key, value);
-            }
-            
-            // Save as encrypted and remove old file
-            saveTokens();
-            fs.unlinkSync(TOKENS_FILE);
-            console.log('✅ Migration complete! Tokens are now encrypted.');
-        }
+        console.log(`📦 Loaded ${records.length} session record(s) from MySQL.`);
     } catch (error) {
-        console.error('Error loading tokens:', error);
-        sessionTokens.clear();
+        console.error('Error loading sessions from database:', error);
+    }
+}
+
+async function ensureTokensForSessions() {
+    const missing = [];
+    for (const sessionId of sessions.keys()) {
+        if (!sessionTokens.has(sessionId)) {
+            const fallbackToken = randomUUID();
+            await persistSessionToken(sessionId, fallbackToken);
+            missing.push(sessionId);
+        }
+    }
+
+    if (missing.length > 0) {
+        console.log(`🔑 Generated API tokens for ${missing.length} session(s) that were missing credentials.`);
+    }
+}
+
+async function persistSessionToken(sessionId, token) {
+    sessionTokens.set(sessionId, token);
+    try {
+        await prisma.sessionToken.upsert({
+            where: { sessionId },
+            update: {
+                tokenValue: token,
+                lastUsedAt: new Date()
+            },
+            create: {
+                sessionId,
+                tokenValue: token
+            }
+        });
+    } catch (error) {
+        console.error(`Error saving token for session ${sessionId}:`, error);
+    }
+}
+
+async function removeSessionToken(sessionId) {
+    sessionTokens.delete(sessionId);
+    try {
+        await prisma.sessionToken.delete({ where: { sessionId } });
+    } catch (error) {
+        if (error.code !== 'P2025') {
+            console.error(`Error deleting token for session ${sessionId}:`, error);
+        }
     }
 }
 
@@ -206,7 +221,8 @@ app.use(
     contentSecurityPolicy: {
       directives: {
         ...helmet.contentSecurityPolicy.getDefaultDirectives(),
-        "script-src": ["'self'", "'unsafe-inline'"]
+        "script-src": ["'self'", "'unsafe-inline'"],
+        "script-src-attr": ["'unsafe-inline'"]
       }
     }
   })
@@ -226,6 +242,22 @@ const ADMIN_PASSWORD = process.env.ADMIN_DASHBOARD_PASSWORD;
 // Session limits configuration
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 10;
 const SESSION_TIMEOUT_HOURS = parseInt(process.env.SESSION_TIMEOUT_HOURS) || 24;
+
+// Handle WebSocket upgrade requests on /ws path
+server.on('upgrade', (request, socket, head) => {
+    const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+    
+    // Only handle /ws path for WebSocket connections
+    // We also allow '/' in case the proxy rewrites the path
+    if (pathname === '/ws' || pathname === '/ws/' || pathname === '/') {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            wss.emit('connection', ws, request);
+        });
+    } else {
+        console.log(`[WebSocket] Rejected upgrade for path: ${pathname}`);
+        socket.destroy();
+    }
+});
 
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
@@ -297,6 +329,11 @@ app.get('/api-documentation', (req, res) => {
 // Redirect old URL to new one
 app.get('/api_documentation.md', (req, res) => {
     res.redirect('/api-documentation');
+});
+
+// Serve WebSocket test page
+app.get('/test-websocket.html', (req, res) => {
+    res.sendFile(path.join(__dirname, 'test-websocket.html'));
 });
 
 // Admin login endpoint - supports both legacy password and new email/password
@@ -401,14 +438,16 @@ app.post('/admin/logout', requireAdminAuth, (req, res) => {
 });
 
 // User management endpoints
-app.get('/api/v1/users', requireAdminAuth, (req, res) => {
+app.get('/api/v1/users', requireAdminAuth, async (req, res) => {
     const currentUser = getCurrentUser(req);
     if (currentUser.role === 'admin') {
         // Admin can see all users
-        res.json(userManager.getAllUsers());
+        const users = await userManager.getAllUsers();
+        res.json(users);
     } else {
         // Regular users can only see themselves
-        res.json([userManager.getUser(currentUser.email)]);
+        const user = await userManager.getUser(currentUser.email);
+        res.json([user]);
     }
 });
 
@@ -465,13 +504,13 @@ app.delete('/api/v1/users/:email', requireAdminRole, async (req, res) => {
 });
 
 // Get current user info
-app.get('/api/v1/me', (req, res) => {
+app.get('/api/v1/me', async (req, res) => {
     if (!req.session || !req.session.adminAuthed) {
         return res.status(401).json({ error: 'Authentication required' });
     }
     
     const currentUser = getCurrentUser(req);
-    const user = userManager.getUser(currentUser.email);
+    const user = await userManager.getUser(currentUser.email);
     res.json(user);
 });
 
@@ -485,7 +524,7 @@ app.get('/api/v1/ws-auth', requireAdminAuth, (req, res) => {
     const tokenData = {
         email: currentUser.email,
         role: currentUser.role,
-        expires: Date.now() + 30000 // 30 seconds
+        expires: Date.now() + 31000 // 30 seconds
     };
     
     // Store in a temporary map (you might want to use Redis in production)
@@ -497,7 +536,7 @@ app.get('/api/v1/ws-auth', requireAdminAuth, (req, res) => {
     // Clean up expired tokens
     setTimeout(() => {
         global.wsAuthTokens.delete(wsToken);
-    }, 30000);
+    }, 31000);
     
     res.json({ wsToken });
 });
@@ -733,7 +772,7 @@ async function postToWebhook(data) {
     }
 }
 
-function updateSessionState(sessionId, status, detail, qr, reason) {
+async function updateSessionState(sessionId, status, detail, qr, reason) {
     const oldSession = sessions.get(sessionId) || {};
     const newSession = {
         ...oldSession,
@@ -744,6 +783,23 @@ function updateSessionState(sessionId, status, detail, qr, reason) {
         reason
     };
     sessions.set(sessionId, newSession);
+
+    try {
+        await prisma.session.upsert({
+            where: { id: sessionId },
+            update: { status, detail, qr, reason },
+            create: {
+                id: sessionId,
+                name: sessionId,
+                status,
+                detail,
+                qr,
+                reason
+            }
+        });
+    } catch (error) {
+        console.error(`Failed to persist session ${sessionId} state:`, error);
+    }
 
     broadcast({ type: 'session-update', data: getSessionsDetails() });
 
@@ -758,7 +814,7 @@ function updateSessionState(sessionId, status, detail, qr, reason) {
 
 async function connectToWhatsApp(sessionId) {
     await baileysModuleReady;
-    updateSessionState(sessionId, 'CONNECTING', 'Initializing session...', '', '');
+    await updateSessionState(sessionId, 'CONNECTING', 'Initializing session...', '', '');
     log('Starting session...', sessionId);
 
     const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
@@ -781,7 +837,7 @@ async function connectToWhatsApp(sessionId) {
         browser: Browsers.macOS('Desktop'),
         generateHighQualityLinkPreview: false, // Disable to save memory
         shouldIgnoreJid: (jid) => isJidBroadcast(jid),
-        qrTimeout: 30000,
+        qrTimeout: 31000,
         // Memory optimization settings
         markOnlineOnConnect: false,
         syncFullHistory: false,
@@ -789,8 +845,8 @@ async function connectToWhatsApp(sessionId) {
         retryRequestDelayMs: 2000,
         maxMsgRetryCount: 3,
         // Connection options for stability
-        connectTimeoutMs: 30000,
-        keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 31000,
+        keepAliveIntervalMs: 31000,
         // Disable unnecessary features
         fireInitQueries: false,
         emitOwnEvents: false
@@ -815,7 +871,7 @@ async function connectToWhatsApp(sessionId) {
         }
     });
 
-    sock.ev.on('connection.update', (update) => {
+        sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
         const statusCode = (lastDisconnect?.error instanceof Boom) ? lastDisconnect.error.output.statusCode : 0;
 
@@ -823,7 +879,7 @@ async function connectToWhatsApp(sessionId) {
 
       if (qr) {
             log('QR code generated.', sessionId);
-            updateSessionState(sessionId, 'GENERATING_QR', 'QR code available.', qr, '');
+                        await updateSessionState(sessionId, 'GENERATING_QR', 'QR code available.', qr, '');
         }
 
         if (connection === 'close') {
@@ -833,7 +889,7 @@ async function connectToWhatsApp(sessionId) {
             const shouldReconnect = statusCode !== 401 && statusCode !== 403;
             
             log(`Connection closed. Reason: ${reason}, statusCode: ${statusCode}. Reconnecting: ${shouldReconnect}`, sessionId);
-            updateSessionState(sessionId, 'DISCONNECTED', 'Connection closed.', '', reason);
+            await updateSessionState(sessionId, 'DISCONNECTED', 'Connection closed.', '', reason);
 
             if (shouldReconnect) {
                 setTimeout(() => connectToWhatsApp(sessionId), 5000);
@@ -847,7 +903,7 @@ async function connectToWhatsApp(sessionId) {
             }
         } else if (connection === 'open') {
             log('Connection opened.', sessionId);
-            updateSessionState(sessionId, 'CONNECTED', `Connected as ${sock.user?.name || 'Unknown'}`, '', '');
+            await updateSessionState(sessionId, 'CONNECTED', `Connected as ${sock.user?.name || 'Unknown'}`, '', '');
         }
     });
 
@@ -901,9 +957,22 @@ async function createSession(sessionId, createdBy = null) {
     }
     
     const token = randomUUID();
-    sessionTokens.set(sessionId, token);
-    saveTokens();
+    await persistSessionToken(sessionId, token);
     
+    await prisma.session.upsert({
+        where: { id: sessionId },
+        update: {
+            status: 'CREATING',
+            detail: 'Session is being created.'
+        },
+        create: {
+            id: sessionId,
+            name: sessionId,
+            status: 'CREATING',
+            detail: 'Session is being created.'
+        }
+    });
+
     // Set a placeholder before async connection with owner info
     sessions.set(sessionId, { 
         sessionId: sessionId, 
@@ -939,7 +1008,7 @@ app.get('/api/v1/sessions/:sessionId/qr', async (req, res) => {
         return res.status(404).json({ error: 'Session not found' });
     }
     log(`QR code requested for ${sessionId}`, sessionId);
-    updateSessionState(sessionId, 'GENERATING_QR', 'QR code requested by user.', '', '');
+    await updateSessionState(sessionId, 'GENERATING_QR', 'QR code requested by user.', '', '');
     // The connection logic will handle the actual QR generation and broadcast.
     res.status(200).json({ message: 'QR generation triggered.' });
 });
@@ -960,17 +1029,23 @@ async function deleteSession(sessionId) {
     }
     
     sessions.delete(sessionId);
-    sessionTokens.delete(sessionId);
-    saveTokens();
+    await removeSessionToken(sessionId);
     const sessionDir = path.join(__dirname, 'auth_info_baileys', sessionId);
     if (fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+    try {
+        await prisma.session.delete({ where: { id: sessionId } });
+    } catch (error) {
+        if (error.code !== 'P2025') {
+            console.error(`Failed to remove session ${sessionId} from database:`, error.message);
+        }
     }
     log(`Session ${sessionId} deleted and data cleared.`, 'SYSTEM');
     broadcast({ type: 'session-update', data: getSessionsDetails() });
 }
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3100;
 
 // Handle memory errors gracefully
 process.on('uncaughtException', (error) => {
@@ -988,37 +1063,127 @@ process.on('unhandledRejection', (reason, promise) => {
 
 async function initializeExistingSessions() {
     const sessionsDir = path.join(__dirname, 'auth_info_baileys');
-    if (fs.existsSync(sessionsDir)) {
-        const sessionFolders = fs.readdirSync(sessionsDir);
-        log(`Found ${sessionFolders.length} existing session(s). Initializing...`);
-        for (const sessionId of sessionFolders) {
-            const sessionPath = path.join(sessionsDir, sessionId);
-            if (fs.statSync(sessionPath).isDirectory()) {
-                log(`Re-initializing session: ${sessionId}`);
-                await createSession(sessionId); // Await creation to prevent race conditions
+    if (!fs.existsSync(sessionsDir)) {
+        console.log('No Baileys auth_info directory found. Skipping session restore.');
+        return;
+    }
+
+    const sessionFolders = fs
+        .readdirSync(sessionsDir)
+        .filter((folder) => {
+            const sessionPath = path.join(sessionsDir, folder);
+            try {
+                return fs.statSync(sessionPath).isDirectory();
+            } catch (error) {
+                console.warn(`Skipping unreadable session folder ${folder}:`, error.message);
+                return false;
             }
+        });
+
+    if (sessionFolders.length === 0) {
+        console.log('No stored WhatsApp sessions to restore.');
+        return;
+    }
+
+    log(`Found ${sessionFolders.length} stored session(s). Attempting reconnection...`);
+
+    for (const sessionId of sessionFolders) {
+        if (!sessions.has(sessionId)) {
+            let dbSession = await prisma.session.findUnique({
+                where: { id: sessionId },
+                include: {
+                    owner: {
+                        select: { email: true }
+                    }
+                }
+            });
+
+            if (!dbSession) {
+                dbSession = await prisma.session.create({
+                    data: {
+                        id: sessionId,
+                        name: sessionId,
+                        status: 'CREATING',
+                        detail: 'Session restored from filesystem credentials.'
+                    },
+                    include: {
+                        owner: {
+                            select: { email: true }
+                        }
+                    }
+                });
+            }
+
+            const snapshot = mapSessionRecord(dbSession);
+            if (snapshot) {
+                sessions.set(sessionId, snapshot);
+            }
+        }
+
+        if (!sessionTokens.has(sessionId)) {
+            const fallbackToken = randomUUID();
+            await persistSessionToken(sessionId, fallbackToken);
+            log(`Generated fallback API token for restored session ${sessionId}`, 'SYSTEM');
+        }
+
+        try {
+            await connectToWhatsApp(sessionId);
+        } catch (error) {
+            console.error(`Failed to reconnect session ${sessionId}:`, error);
         }
     }
 }
 
-loadSystemLogFromDisk();
-server.listen(PORT, () => {
-    log(`Server is running on port ${PORT}`);
-    log('Admin dashboard available at http://localhost:3000/admin/dashboard.html');
-    loadTokens(); // Load tokens at startup
-    initializeExistingSessions();
-    
-    // Start campaign scheduler
-    startCampaignScheduler();
+async function startServer() {
+    loadSystemLogFromDisk();
+    await loadSessionsFromDb();
+    await loadSessionTokensFromDb();
+    await ensureTokensForSessions();
+    server.listen(PORT, () => {
+        log(`Server is running on port ${PORT}`);
+        log(`🔌 WebSocket endpoint: ws://localhost:${PORT}/ws`);
+        log('Admin dashboard available at http://localhost:3100/admin/dashboard.html');
+        initializeExistingSessions();
+        startCampaignScheduler();
+    });
+}
+
+startServer().catch((error) => {
+    console.error('Failed to start server:', error);
+    process.exit(1);
 });
 
 // Campaign scheduler to automatically start campaigns at their scheduled time
 function startCampaignScheduler() {
     console.log('📅 Campaign scheduler started - checking every minute for scheduled campaigns');
-    
-    setInterval(async () => {
-        await checkAndStartScheduledCampaigns();
-    }, 60000); // Check every minute (60,000 ms)
+
+    const runScheduler = async () => {
+        try {
+            const result = await checkAndStartScheduledCampaigns();
+            if (result?.error) {
+                console.warn('⚠️ Campaign scheduler reported an error:', result.error);
+                return;
+            }
+
+            if (result?.campaignsToStart) {
+                console.log(`🕒 Scheduler iteration processed ${result.campaignsToStart} pending campaign(s).`);
+            }
+
+            if (result?.recovery && (result.recovery.resumed || result.recovery.completed)) {
+                console.log(
+                    `♻️ Campaign recovery summary: resumed ${result.recovery.resumed} campaign(s), ` +
+                    `completed ${result.recovery.completed} stalled campaign(s).`
+                );
+            }
+        } catch (error) {
+            console.error('❌ Campaign scheduler run failed:', error);
+        }
+    };
+
+    runScheduler();
+    setInterval(() => {
+        runScheduler();
+    }, 60000);
 }
 
 // Use the scheduler function from the API router

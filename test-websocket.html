@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Connection Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .status {
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .status.connected {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.connecting {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+        .log {
+            background: #000;
+            color: #0f0;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 5px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .log div {
+            margin: 5px 0;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .info {
+            background: #e7f3ff;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border-left: 4px solid #007bff;
+        }
+        .error {
+            background: #ffe7e7;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border-left: 4px solid #dc3545;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔌 WebSocket Connection Test</h1>
+        
+        <div id="status" class="status disconnected">
+            Status: Disconnected
+        </div>
+        
+        <div class="info">
+            <strong>Test Information:</strong><br>
+            Protocol: <span id="protocol"></span><br>
+            Host: <span id="host"></span><br>
+            Full URL: <span id="fullUrl"></span>
+        </div>
+        
+        <div>
+            <button id="btnConnect" onclick="testConnection()">Connect to /ws</button>
+            <button id="btnConnectRoot" onclick="testConnectionRoot()">Connect to /</button>
+            <button id="btnDisconnect" onclick="disconnect()" disabled>Disconnect</button>
+            <button onclick="clearLog()">Clear Log</button>
+            <button onclick="testWithAuth()">Test With Auth Token</button>
+        </div>
+        
+        <div class="log" id="log"></div>
+    </div>
+
+    <script>
+        let ws = null;
+        const logDiv = document.getElementById('log');
+        const statusDiv = document.getElementById('status');
+        const btnConnect = document.getElementById('btnConnect');
+        const btnDisconnect = document.getElementById('btnDisconnect');
+        
+        // Display connection info
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.host;
+        const wsPath = '/ws';
+        const fullUrl = `${protocol}//${host}${wsPath}`;
+        document.getElementById('protocol').textContent = protocol;
+        document.getElementById('host').textContent = host;
+        document.getElementById('fullUrl').textContent = fullUrl;
+
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const div = document.createElement('div');
+            div.style.color = type === 'error' ? '#ff6b6b' : 
+                             type === 'success' ? '#51cf66' : 
+                             type === 'warning' ? '#ffd43b' : '#0f0';
+            div.textContent = `[${timestamp}] ${message}`;
+            logDiv.appendChild(div);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        function updateStatus(status, className) {
+            statusDiv.textContent = `Status: ${status}`;
+            statusDiv.className = `status ${className}`;
+        }
+
+        function testConnection() {
+            connectToPath('/ws');
+        }
+
+        function testConnectionRoot() {
+            connectToPath('/');
+        }
+
+        function connectToPath(path) {
+            const targetUrl = `${protocol}//${host}${path}`;
+            log('=== Starting WebSocket Connection Test ===', 'warning');
+            log(`Attempting to connect to: ${targetUrl}`);
+            
+            try {
+                updateStatus(`Connecting to ${path}...`, 'connecting');
+                
+                ws = new WebSocket(targetUrl);
+                
+                ws.onopen = function(event) {
+                    log(`✅ WebSocket connection to ${path} opened successfully!`, 'success');
+                    updateStatus('Connected', 'connected');
+                    btnConnect.disabled = true;
+                    document.getElementById('btnConnectRoot').disabled = true;
+                    btnDisconnect.disabled = false;
+                    
+                    log('Connection details:', 'info');
+                    log(`  - ReadyState: ${ws.readyState}`, 'info');
+                    log(`  - Protocol: ${ws.protocol || 'none'}`, 'info');
+                };
+                
+                ws.onmessage = function(event) {
+                    log(`📨 Message received: ${event.data}`, 'success');
+                    try {
+                        const data = JSON.parse(event.data);
+                        log(`   Type: ${data.type}`, 'info');
+                        log(`   Data: ${JSON.stringify(data, null, 2)}`, 'info');
+                    } catch (e) {
+                        log(`   Raw data: ${event.data}`, 'info');
+                    }
+                };
+                
+                ws.onerror = function(event) {
+                    log('❌ WebSocket error occurred!', 'error');
+                    log(`   Error event: ${JSON.stringify(event)}`, 'error');
+                    updateStatus('Error', 'disconnected');
+                };
+                
+                ws.onclose = function(event) {
+                    log('🔌 WebSocket connection closed', 'warning');
+                    log(`   Code: ${event.code}`, 'info');
+                    log(`   Reason: ${event.reason || 'No reason provided'}`, 'info');
+                    log(`   Clean: ${event.wasClean}`, 'info');
+                    updateStatus('Disconnected', 'disconnected');
+                    btnConnect.disabled = false;
+                    document.getElementById('btnConnectRoot').disabled = false;
+                    btnDisconnect.disabled = true;
+                };
+                
+            } catch (error) {
+                log(`❌ Exception while creating WebSocket: ${error.message}`, 'error');
+                log(`   Stack: ${error.stack}`, 'error');
+                updateStatus('Error', 'disconnected');
+            }
+        }
+
+        async function testWithAuth() {
+            log('=== Testing with Authentication Token ===', 'warning');
+            
+            try {
+                // First, get auth token
+                log('Fetching WebSocket auth token from /api/v1/ws-auth...');
+                const response = await fetch('/api/v1/ws-auth');
+                
+                if (!response.ok) {
+                    log(`❌ Failed to get auth token: ${response.status} ${response.statusText}`, 'error');
+                    const text = await response.text();
+                    log(`   Response: ${text}`, 'error');
+                    return;
+                }
+                
+                const data = await response.json();
+                log(`✅ Auth token received: ${data.wsToken.substring(0, 20)}...`, 'success');
+                
+                // Connect with token
+                const wsUrl = `${fullUrl}?token=${data.wsToken}`;
+                log(`Connecting to: ${wsUrl.substring(0, 60)}...`);
+                
+                updateStatus('Connecting with auth...', 'connecting');
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = function(event) {
+                    log('✅ Authenticated WebSocket connection opened!', 'success');
+                    updateStatus('Connected (Authenticated)', 'connected');
+                    btnConnect.disabled = true;
+                    btnDisconnect.disabled = false;
+                };
+                
+                ws.onmessage = function(event) {
+                    log(`📨 Message received: ${event.data}`, 'success');
+                    try {
+                        const data = JSON.parse(event.data);
+                        log(`   Type: ${data.type}`, 'info');
+                        if (data.type === 'session-update') {
+                            log(`   Sessions: ${data.data.length}`, 'info');
+                        }
+                    } catch (e) {
+                        log(`   Raw: ${event.data}`, 'info');
+                    }
+                };
+                
+                ws.onerror = function(event) {
+                    log('❌ WebSocket error!', 'error');
+                    updateStatus('Error', 'disconnected');
+                };
+                
+                ws.onclose = function(event) {
+                    log(`🔌 Connection closed - Code: ${event.code}, Reason: ${event.reason}`, 'warning');
+                    updateStatus('Disconnected', 'disconnected');
+                    btnConnect.disabled = false;
+                    btnDisconnect.disabled = true;
+                };
+                
+            } catch (error) {
+                log(`❌ Error during auth test: ${error.message}`, 'error');
+                log(`   Stack: ${error.stack}`, 'error');
+            }
+        }
+
+        function disconnect() {
+            if (ws) {
+                log('Disconnecting...', 'warning');
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function clearLog() {
+            logDiv.innerHTML = '';
+        }
+
+        // Test on page load
+        window.addEventListener('load', function() {
+            log('Page loaded. Ready to test WebSocket connection.', 'info');
+            log(`Browser: ${navigator.userAgent}`, 'info');
+            log(`WebSocket support: ${typeof WebSocket !== 'undefined' ? 'Yes' : 'No'}`, 'info');
+        });
+    </script>
+</body>
+</html>

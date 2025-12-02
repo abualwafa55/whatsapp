@@ -659,7 +659,7 @@ function copyCurl(id, btn) {
     </div>
 
     <footer class="text-center text-muted py-4">
-        <small>Super-Light-Web-WhatsApp-API-Server by Alucard0x1</small>
+        <small>SitenHost.com</small>
     </footer>
 
     <script src="/admin/js/bootstrap.bundle.min.js"></script>
@@ -1339,7 +1339,7 @@ function copyCurl(id, btn) {
                 .then(res => res.json())
                 .then(data => {
                     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                    const ws = new WebSocket(`${protocol}//${window.location.host}?token=${data.wsToken}`);
+                    const ws = new WebSocket(`${protocol}//${window.location.host}/ws?token=${data.wsToken}`);
 
                     ws.onopen = () => {
                         logBox.innerHTML = ''; // Clear previous logs

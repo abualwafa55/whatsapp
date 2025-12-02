@@ -202,12 +202,16 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     };
     
     // Campaign routes - these use session auth, not token auth
-    router.get('/campaigns', checkCampaignAccess, (req, res) => {
-        const campaigns = campaignManager.getAllCampaigns(
-            req.currentUser.email,
-            req.currentUser.role === 'admin'
-        );
-        res.json(campaigns);
+    router.get('/campaigns', checkCampaignAccess, async (req, res) => {
+        try {
+            const campaigns = await campaignManager.getAllCampaigns(
+                req.currentUser.email,
+                req.currentUser.role === 'admin'
+            );
+            res.json(campaigns);
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
     });
     
     // Function to check and start campaigns (shared with scheduler and API endpoints)
@@ -218,7 +222,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
             }
             
             const now = new Date();
-            const campaigns = campaignManager.getAllCampaigns();
+            const campaigns = await campaignManager.getAllCampaigns();
             
             // Find campaigns that should be started
             const campaignsToStart = campaigns.filter(campaign => {
@@ -260,6 +264,8 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
                 }
             }
             
+            const recovery = await campaignSender.recoverStalledCampaigns();
+
             return {
                 totalCampaigns: campaigns.length,
                 campaignsToStart: campaignsToStart.length,
@@ -268,7 +274,8 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
                     name: c.name,
                     status: c.status,
                     scheduledAt: c.scheduledAt
-                }))
+                })),
+                recovery
             };
             
         } catch (error) {
@@ -308,15 +315,28 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
 
+    router.post('/campaigns/recover-stalled', checkCampaignAccess, async (req, res) => {
+        if (req.currentUser.role !== 'admin') {
+            return res.status(403).json({ status: 'error', message: 'Admin access required' });
+        }
+
+        try {
+            const report = await campaignSender.recoverStalledCampaigns();
+            res.json({ status: 'success', ...report });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
+    });
+
     // Endpoint to get campaigns that should have been started but are still in ready status (MUST be before /:id route)
-    router.get('/campaigns/overdue', checkCampaignAccess, (req, res) => {
+    router.get('/campaigns/overdue', checkCampaignAccess, async (req, res) => {
         try {
             if (!campaignManager) {
                 return res.status(503).json({ error: 'Campaign manager not initialized' });
             }
             
             const now = new Date();
-            const campaigns = campaignManager.getAllCampaigns();
+            const campaigns = await campaignManager.getAllCampaigns();
             
             const overdueCampaigns = campaigns.filter(campaign => {
                 return (
@@ -344,18 +364,21 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
     
-    router.get('/campaigns/:id', checkCampaignAccess, (req, res) => {
-        const campaign = campaignManager.loadCampaign(req.params.id);
-        if (!campaign) {
-            return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+    router.get('/campaigns/:id', checkCampaignAccess, async (req, res) => {
+        try {
+            const campaign = await campaignManager.loadCampaign(req.params.id);
+            if (!campaign) {
+                return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+            }
+            
+            if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
+                return res.status(403).json({ status: 'error', message: 'Access denied' });
+            }
+            
+            res.json(campaign);
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
         }
-        
-        // Check access
-        if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
-            return res.status(403).json({ status: 'error', message: 'Access denied' });
-        }
-        
-        res.json(campaign);
     });
     
     router.post('/campaigns', checkCampaignAccess, async (req, res) => {
@@ -365,7 +388,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
                 createdBy: req.currentUser.email
             };
             
-            const campaign = campaignManager.createCampaign(campaignData);
+            const campaign = await campaignManager.createCampaign(campaignData);
             
             // Log activity
             await activityLogger.logCampaignCreate(
@@ -381,19 +404,18 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
     
-    router.put('/campaigns/:id', checkCampaignAccess, (req, res) => {
+    router.put('/campaigns/:id', checkCampaignAccess, async (req, res) => {
         try {
-            const campaign = campaignManager.loadCampaign(req.params.id);
+            const campaign = await campaignManager.loadCampaign(req.params.id);
             if (!campaign) {
                 return res.status(404).json({ status: 'error', message: 'Campaign not found' });
             }
             
-            // Check access
             if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
                 return res.status(403).json({ status: 'error', message: 'Access denied' });
             }
             
-            const updated = campaignManager.updateCampaign(req.params.id, req.body);
+            const updated = await campaignManager.updateCampaign(req.params.id, req.body);
             res.json(updated);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
@@ -401,31 +423,33 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
     
     router.delete('/campaigns/:id', checkCampaignAccess, async (req, res) => {
-        const campaign = campaignManager.loadCampaign(req.params.id);
-        if (!campaign) {
-            return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+        try {
+            const campaign = await campaignManager.loadCampaign(req.params.id);
+            if (!campaign) {
+                return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+            }
+            
+            if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
+                return res.status(403).json({ status: 'error', message: 'Access denied' });
+            }
+            
+            await campaignManager.deleteCampaign(req.params.id);
+            
+            await activityLogger.logCampaignDelete(
+                req.currentUser.email,
+                req.params.id,
+                campaign.name
+            );
+            
+            res.json({ status: 'success', message: 'Campaign deleted' });
+        } catch (error) {
+            res.status(400).json({ status: 'error', message: error.message });
         }
-        
-        // Check access
-        if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
-            return res.status(403).json({ status: 'error', message: 'Access denied' });
-        }
-        
-        campaignManager.deleteCampaign(req.params.id);
-        
-        // Log activity
-        await activityLogger.logCampaignDelete(
-            req.currentUser.email,
-            req.params.id,
-            campaign.name
-        );
-        
-        res.json({ status: 'success', message: 'Campaign deleted' });
     });
     
     router.post('/campaigns/:id/clone', checkCampaignAccess, async (req, res) => {
         try {
-            const cloned = campaignManager.cloneCampaign(req.params.id, req.currentUser.email);
+            const cloned = await campaignManager.cloneCampaign(req.params.id, req.currentUser.email);
             res.status(201).json(cloned);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
@@ -442,16 +466,20 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
     
     router.post('/campaigns/:id/pause', checkCampaignAccess, async (req, res) => {
-        const result = campaignSender.pauseCampaign(req.params.id);
-        if (result) {
-            await activityLogger.logCampaignPause(
-                req.currentUser.email,
-                req.params.id,
-                'Campaign paused by user'
-            );
-            res.json({ status: 'success', message: 'Campaign paused' });
-        } else {
-            res.status(400).json({ status: 'error', message: 'Campaign not running' });
+        try {
+            const result = await campaignSender.pauseCampaign(req.params.id);
+            if (result) {
+                await activityLogger.logCampaignPause(
+                    req.currentUser.email,
+                    req.params.id,
+                    'Campaign paused by user'
+                );
+                res.json({ status: 'success', message: 'Campaign paused' });
+            } else {
+                res.status(400).json({ status: 'error', message: 'Campaign not running' });
+            }
+        } catch (error) {
+            res.status(400).json({ status: 'error', message: error.message });
         }
     });
     
@@ -473,29 +501,39 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
     
-    router.get('/campaigns/:id/status', checkCampaignAccess, (req, res) => {
-        const status = campaignSender.getCampaignStatus(req.params.id);
-        if (!status) {
-            return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+    router.get('/campaigns/:id/status', checkCampaignAccess, async (req, res) => {
+        try {
+            const status = await campaignSender.getCampaignStatus(req.params.id);
+            if (!status) {
+                return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+            }
+            res.json(status);
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
         }
-        res.json(status);
     });
     
-    router.get('/campaigns/:id/export', checkCampaignAccess, (req, res) => {
-        const campaign = campaignManager.loadCampaign(req.params.id);
-        if (!campaign) {
-            return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+    router.get('/campaigns/:id/export', checkCampaignAccess, async (req, res) => {
+        try {
+            const campaign = await campaignManager.loadCampaign(req.params.id);
+            if (!campaign) {
+                return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+            }
+            
+            if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
+                return res.status(403).json({ status: 'error', message: 'Access denied' });
+            }
+            
+            const csv = await campaignManager.exportResults(req.params.id);
+            if (!csv) {
+                return res.status(404).json({ status: 'error', message: 'No recipients found for export' });
+            }
+            res.setHeader('Content-Type', 'text/csv');
+            res.setHeader('Content-Disposition', `attachment; filename="${campaign.name}_results.csv"`);
+            res.send(csv);
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
         }
-        
-        // Check access
-        if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
-            return res.status(403).json({ status: 'error', message: 'Access denied' });
-        }
-        
-        const csv = campaignManager.exportResults(req.params.id);
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', `attachment; filename="${campaign.name}_results.csv"`);
-        res.send(csv);
     });
     
     router.post('/campaigns/preview-csv', checkCampaignAccess, upload.single('file'), (req, res) => {
@@ -522,44 +560,53 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
 
 
 
-    // Export the function for use by the main scheduler
+    // Export scheduler utilities for the main process
     router.checkAndStartScheduledCampaigns = checkAndStartScheduledCampaigns;
+    router.recoverStalledCampaigns = () => campaignSender.recoverStalledCampaigns();
 
     // Recipient List Management Endpoints (Session-based auth, not token-based)
     
     // Get all recipient lists
-    router.get('/recipient-lists', checkCampaignAccess, (req, res) => {
-        const lists = recipientListManager.getAllLists(
-            req.currentUser.email,
-            req.currentUser.role === 'admin'
-        );
-        res.json(lists);
+    router.get('/recipient-lists', checkCampaignAccess, async (req, res) => {
+        try {
+            const lists = await recipientListManager.getAllLists(
+                req.currentUser.email,
+                req.currentUser.role === 'admin'
+            );
+            res.json(lists);
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
     });
     
     // Get specific recipient list
-    router.get('/recipient-lists/:id', checkCampaignAccess, (req, res) => {
-        const list = recipientListManager.loadList(req.params.id);
-        if (!list) {
-            return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
+    router.get('/recipient-lists/:id', checkCampaignAccess, async (req, res) => {
+        try {
+            const list = await recipientListManager.loadList(req.params.id);
+            if (!list) {
+                return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
+            }
+            
+            // Check access
+            if (req.currentUser.role !== 'admin' && list.createdBy !== req.currentUser.email) {
+                return res.status(403).json({ status: 'error', message: 'Access denied' });
+            }
+            
+            res.json(list);
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
         }
-        
-        // Check access
-        if (req.currentUser.role !== 'admin' && list.createdBy !== req.currentUser.email) {
-            return res.status(403).json({ status: 'error', message: 'Access denied' });
-        }
-        
-        res.json(list);
     });
     
     // Create new recipient list
-    router.post('/recipient-lists', checkCampaignAccess, (req, res) => {
+    router.post('/recipient-lists', checkCampaignAccess, async (req, res) => {
         try {
             const listData = {
                 ...req.body,
                 createdBy: req.currentUser.email
             };
             
-            const list = recipientListManager.createList(listData);
+            const list = await recipientListManager.createList(listData);
             res.status(201).json(list);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
@@ -567,9 +614,9 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
     
     // Update recipient list
-    router.put('/recipient-lists/:id', checkCampaignAccess, (req, res) => {
+    router.put('/recipient-lists/:id', checkCampaignAccess, async (req, res) => {
         try {
-            const list = recipientListManager.loadList(req.params.id);
+            const list = await recipientListManager.loadList(req.params.id);
             if (!list) {
                 return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
             }
@@ -579,7 +626,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
                 return res.status(403).json({ status: 'error', message: 'Access denied' });
             }
             
-            const updated = recipientListManager.updateList(req.params.id, req.body);
+            const updated = await recipientListManager.updateList(req.params.id, req.body);
             res.json(updated);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
@@ -587,29 +634,33 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
     
     // Delete recipient list
-    router.delete('/recipient-lists/:id', checkCampaignAccess, (req, res) => {
-        const list = recipientListManager.loadList(req.params.id);
-        if (!list) {
-            return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
-        }
-        
-        // Check access
-        if (req.currentUser.role !== 'admin' && list.createdBy !== req.currentUser.email) {
-            return res.status(403).json({ status: 'error', message: 'Access denied' });
-        }
-        
-        const success = recipientListManager.deleteList(req.params.id);
-        if (success) {
-            res.json({ status: 'success', message: 'Recipient list deleted' });
-        } else {
-            res.status(500).json({ status: 'error', message: 'Failed to delete recipient list' });
+    router.delete('/recipient-lists/:id', checkCampaignAccess, async (req, res) => {
+        try {
+            const list = await recipientListManager.loadList(req.params.id);
+            if (!list) {
+                return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
+            }
+            
+            // Check access
+            if (req.currentUser.role !== 'admin' && list.createdBy !== req.currentUser.email) {
+                return res.status(403).json({ status: 'error', message: 'Access denied' });
+            }
+            
+            const success = await recipientListManager.deleteList(req.params.id);
+            if (success) {
+                res.json({ status: 'success', message: 'Recipient list deleted' });
+            } else {
+                res.status(500).json({ status: 'error', message: 'Failed to delete recipient list' });
+            }
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
         }
     });
     
     // Clone recipient list
-    router.post('/recipient-lists/:id/clone', checkCampaignAccess, (req, res) => {
+    router.post('/recipient-lists/:id/clone', checkCampaignAccess, async (req, res) => {
         try {
-            const cloned = recipientListManager.cloneList(req.params.id, req.currentUser.email, req.body.name);
+            const cloned = await recipientListManager.cloneList(req.params.id, req.currentUser.email, req.body.name);
             res.status(201).json(cloned);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
@@ -617,9 +668,9 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
     
     // Add recipient to list
-    router.post('/recipient-lists/:id/recipients', checkCampaignAccess, (req, res) => {
+    router.post('/recipient-lists/:id/recipients', checkCampaignAccess, async (req, res) => {
         try {
-            const list = recipientListManager.loadList(req.params.id);
+            const list = await recipientListManager.loadList(req.params.id);
             if (!list) {
                 return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
             }
@@ -629,7 +680,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
                 return res.status(403).json({ status: 'error', message: 'Access denied' });
             }
             
-            const updated = recipientListManager.addRecipient(req.params.id, req.body);
+            const updated = await recipientListManager.addRecipient(req.params.id, req.body);
             res.status(201).json(updated);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
@@ -637,9 +688,9 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
     
     // Update recipient in list
-    router.put('/recipient-lists/:id/recipients/:number', checkCampaignAccess, (req, res) => {
+    router.put('/recipient-lists/:id/recipients/:number', checkCampaignAccess, async (req, res) => {
         try {
-            const list = recipientListManager.loadList(req.params.id);
+            const list = await recipientListManager.loadList(req.params.id);
             if (!list) {
                 return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
             }
@@ -649,7 +700,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
                 return res.status(403).json({ status: 'error', message: 'Access denied' });
             }
             
-            const updated = recipientListManager.updateRecipient(req.params.id, req.params.number, req.body);
+            const updated = await recipientListManager.updateRecipient(req.params.id, req.params.number, req.body);
             res.json(updated);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
@@ -657,9 +708,9 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
     
     // Remove recipient from list
-    router.delete('/recipient-lists/:id/recipients/:number', checkCampaignAccess, (req, res) => {
+    router.delete('/recipient-lists/:id/recipients/:number', checkCampaignAccess, async (req, res) => {
         try {
-            const list = recipientListManager.loadList(req.params.id);
+            const list = await recipientListManager.loadList(req.params.id);
             if (!list) {
                 return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
             }
@@ -669,7 +720,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
                 return res.status(403).json({ status: 'error', message: 'Access denied' });
             }
             
-            const updated = recipientListManager.removeRecipient(req.params.id, req.params.number);
+            const updated = await recipientListManager.removeRecipient(req.params.id, req.params.number);
             res.json(updated);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
@@ -677,38 +728,50 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
     
     // Search recipients across all lists
-    router.get('/recipient-lists/search/:query', checkCampaignAccess, (req, res) => {
-        const results = recipientListManager.searchRecipients(
-            req.params.query,
-            req.currentUser.email,
-            req.currentUser.role === 'admin'
-        );
-        res.json(results);
+    router.get('/recipient-lists/search/:query', checkCampaignAccess, async (req, res) => {
+        try {
+            const results = await recipientListManager.searchRecipients(
+                req.params.query,
+                req.currentUser.email,
+                req.currentUser.role === 'admin'
+            );
+            res.json(results);
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
     });
     
     // Get recipient lists statistics
-    router.get('/recipient-lists-stats', checkCampaignAccess, (req, res) => {
-        const stats = recipientListManager.getStatistics(
-            req.currentUser.email,
-            req.currentUser.role === 'admin'
-        );
-        res.json(stats);
+    router.get('/recipient-lists-stats', checkCampaignAccess, async (req, res) => {
+        try {
+            const stats = await recipientListManager.getStatistics(
+                req.currentUser.email,
+                req.currentUser.role === 'admin'
+            );
+            res.json(stats);
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
     });
     
     // Mark recipient list as used
-    router.post('/recipient-lists/:id/mark-used', checkCampaignAccess, (req, res) => {
-        const list = recipientListManager.loadList(req.params.id);
-        if (!list) {
-            return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
+    router.post('/recipient-lists/:id/mark-used', checkCampaignAccess, async (req, res) => {
+        try {
+            const list = await recipientListManager.loadList(req.params.id);
+            if (!list) {
+                return res.status(404).json({ status: 'error', message: 'Recipient list not found' });
+            }
+            
+            // Check access
+            if (req.currentUser.role !== 'admin' && list.createdBy !== req.currentUser.email) {
+                return res.status(403).json({ status: 'error', message: 'Access denied' });
+            }
+            
+            await recipientListManager.markAsUsed(req.params.id);
+            res.json({ status: 'success', message: 'List marked as used' });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
         }
-        
-        // Check access
-        if (req.currentUser.role !== 'admin' && list.createdBy !== req.currentUser.email) {
-            return res.status(403).json({ status: 'error', message: 'Access denied' });
-        }
-        
-        recipientListManager.markAsUsed(req.params.id);
-        res.json({ status: 'success', message: 'List marked as used' });
     });
     
     // Debug endpoint to check session status
@@ -742,7 +805,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         try {
             // Check ownership if user is authenticated
             if (currentUser && currentUser.role !== 'admin' && userManager) {
-                const sessionOwner = userManager.getSessionOwner(sessionId);
+                const sessionOwner = await userManager.getSessionOwner(sessionId);
                 if (sessionOwner && sessionOwner.email !== currentUser.email) {
                     return res.status(403).json({ 
                         status: 'error', 
@@ -977,7 +1040,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         // Log activity for each successful message
         if (activityLogger) {
             const currentUser = req.session && req.session.adminAuthed ? req.session.userEmail : null;
-            const sessionOwner = userManager ? userManager.getSessionOwner(sessionId) : null;
+            const sessionOwner = userManager ? await userManager.getSessionOwner(sessionId) : null;
             const userEmail = currentUser || (sessionOwner ? sessionOwner.email : 'api-user');
             
             for (let i = 0; i < results.length; i++) {

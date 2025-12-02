@@ -12,7 +12,7 @@ class CampaignSender extends EventEmitter {
 
     // Start sending a campaign
     async startCampaign(campaignId, userEmail) {
-        const campaign = this.campaignManager.loadCampaign(campaignId);
+        const campaign = await this.campaignManager.loadCampaign(campaignId);
         if (!campaign) {
             throw new Error('Campaign not found');
         }
@@ -62,13 +62,16 @@ class CampaignSender extends EventEmitter {
         });
 
         // Update campaign status
-        this.campaignManager.updateCampaignStatus(campaignId, 'sending');
+        await this.campaignManager.updateCampaignStatus(campaignId, 'sending');
 
         // Log activity
         await this.activityLogger.logCampaignStart(userEmail, campaignId, campaign.name, campaign.recipients.length);
 
         // Start processing
-        this.processQueue(campaignId);
+        this.processQueue(campaignId).catch(async (error) => {
+            console.error(`Campaign ${campaignId} queue error:`, error);
+            await this.pauseCampaign(campaignId, error.message);
+        });
 
         return {
             campaignId,
@@ -82,7 +85,7 @@ class CampaignSender extends EventEmitter {
         const queue = this.activeQueues.get(campaignId);
         if (!queue || queue.status !== 'running') return;
 
-        const campaign = this.campaignManager.loadCampaign(campaignId);
+        const campaign = await this.campaignManager.loadCampaign(campaignId);
         if (!campaign) {
             this.stopCampaign(campaignId);
             return;
@@ -97,12 +100,12 @@ class CampaignSender extends EventEmitter {
         
         if (!session || session.status !== 'CONNECTED' || !session.sock) {
             console.error(`Session ${campaign.sessionId} not available or not connected`);
-            this.pauseCampaign(campaignId, 'Session disconnected or not available');
+            await this.pauseCampaign(campaignId, 'Session disconnected or not available');
             return;
         }
 
         // Get next batch of recipients
-        const pendingRecipients = this.campaignManager.getPendingRecipients(campaignId, 1);
+        const pendingRecipients = await this.campaignManager.getPendingRecipients(campaignId, 1);
         
         console.log(`📋 Pending recipients check:`, {
             campaignId: campaignId,
@@ -114,7 +117,7 @@ class CampaignSender extends EventEmitter {
         if (pendingRecipients.length === 0) {
             console.log(`⚠️ No pending recipients found, completing campaign`);
             // Campaign completed
-            this.completeCampaign(campaignId);
+            await this.completeCampaign(campaignId);
             return;
         }
 
@@ -178,7 +181,7 @@ class CampaignSender extends EventEmitter {
             await session.sock.sendMessage(jid, messageData);
             
             // Update recipient status
-            this.campaignManager.updateRecipientStatus(campaignId, recipient.number, 'sent');
+            await this.campaignManager.updateRecipientStatus(campaignId, recipient.number, 'sent');
             
             // Update stats
             queue.processedCount++;
@@ -215,7 +218,7 @@ class CampaignSender extends EventEmitter {
             console.error(`❌ Error sending to ${recipient.number}:`, error.message);
             
             // Update recipient status with error
-            this.campaignManager.updateRecipientStatus(
+            await this.campaignManager.updateRecipientStatus(
                 campaignId, 
                 recipient.number, 
                 'failed', 
@@ -251,13 +254,16 @@ class CampaignSender extends EventEmitter {
             console.log(`⏳ Waiting ${delay}ms (${delay/1000} seconds) before next message at ${new Date().toISOString()}`);
             setTimeout(() => {
                 console.log(`⏰ Delay complete, processing next message at ${new Date().toISOString()}`);
-                this.processQueue(campaignId);
+                this.processQueue(campaignId).catch(async (err) => {
+                    console.error(`Campaign ${campaignId} queue error:`, err);
+                    await this.pauseCampaign(campaignId, err.message);
+                });
             }, delay);
         }
     }
 
     // Pause campaign
-    pauseCampaign(campaignId, reason = null) {
+    async pauseCampaign(campaignId, reason = null) {
         const queue = this.activeQueues.get(campaignId);
         if (!queue) return;
 
@@ -267,7 +273,7 @@ class CampaignSender extends EventEmitter {
             queue.interval = null;
         }
 
-        this.campaignManager.updateCampaignStatus(campaignId, 'paused');
+        await this.campaignManager.updateCampaignStatus(campaignId, 'paused');
 
         this.emit('status', {
             campaignId,
@@ -281,7 +287,7 @@ class CampaignSender extends EventEmitter {
     // Resume campaign
     async resumeCampaign(campaignId, userEmail) {
         const queue = this.activeQueues.get(campaignId);
-        const campaign = this.campaignManager.loadCampaign(campaignId);
+        const campaign = await this.campaignManager.loadCampaign(campaignId);
         
         if (!campaign) {
             throw new Error('Campaign not found');
@@ -315,13 +321,16 @@ class CampaignSender extends EventEmitter {
             queue.status = 'running';
         }
 
-        this.campaignManager.updateCampaignStatus(campaignId, 'sending');
+        await this.campaignManager.updateCampaignStatus(campaignId, 'sending');
 
         // Log activity
         await this.activityLogger.logCampaignResume(userEmail, campaignId, campaign.name);
 
         // Start processing
-        this.processQueue(campaignId);
+        this.processQueue(campaignId).catch(async (error) => {
+            console.error(`Campaign ${campaignId} queue error:`, error);
+            await this.pauseCampaign(campaignId, error.message);
+        });
 
         this.emit('status', {
             campaignId,
@@ -352,14 +361,14 @@ class CampaignSender extends EventEmitter {
     // Complete campaign
     async completeCampaign(campaignId) {
         const queue = this.activeQueues.get(campaignId);
-        const campaign = this.campaignManager.loadCampaign(campaignId);
+        const campaign = await this.campaignManager.loadCampaign(campaignId);
         
         if (queue) {
             this.stopCampaign(campaignId);
         }
 
         if (campaign) {
-            this.campaignManager.updateCampaignStatus(campaignId, 'completed');
+            await this.campaignManager.updateCampaignStatus(campaignId, 'completed');
             
             // Log activity
             await this.activityLogger.logCampaignComplete(
@@ -378,19 +387,19 @@ class CampaignSender extends EventEmitter {
 
     // Retry failed messages
     async retryFailed(campaignId, userEmail) {
-        const campaign = this.campaignManager.loadCampaign(campaignId);
+        const campaign = await this.campaignManager.loadCampaign(campaignId);
         if (!campaign) {
             throw new Error('Campaign not found');
         }
 
         // Mark all failed recipients for retry
         let retryCount = 0;
-        campaign.recipients.forEach(recipient => {
+        for (const recipient of campaign.recipients) {
             if (recipient.status === 'failed') {
-                this.campaignManager.markForRetry(campaignId, recipient.number);
+                await this.campaignManager.markForRetry(campaignId, recipient.number);
                 retryCount++;
             }
-        });
+        }
 
         if (retryCount > 0) {
             // Log activity
@@ -409,11 +418,49 @@ class CampaignSender extends EventEmitter {
         };
     }
 
+    async recoverStalledCampaigns() {
+        const result = { scanned: 0, resumed: 0, completed: 0 };
+        try {
+            const stalledCampaigns = await this.campaignManager.getCampaignsByStatus(
+                ['sending', 'running'],
+                { includeRecipients: true }
+            );
+
+            for (const campaign of stalledCampaigns) {
+                result.scanned += 1;
+
+                if (this.activeQueues.has(campaign.id)) {
+                    continue;
+                }
+
+                const hasPendingRecipients = campaign.recipients.some((recipient) =>
+                    recipient.status === 'pending' || recipient.status === 'failed'
+                );
+
+                if (!hasPendingRecipients) {
+                    await this.completeCampaign(campaign.id);
+                    result.completed += 1;
+                    continue;
+                }
+
+                const resumeActor = campaign.createdBy || campaign.createdByEmail || 'system@auto';
+                console.log(`♻️ Recovering stalled campaign ${campaign.name} (${campaign.id})`);
+                await this.resumeCampaign(campaign.id, resumeActor);
+                result.resumed += 1;
+            }
+        } catch (error) {
+            console.error('Failed to recover stalled campaigns:', error);
+            result.error = error.message;
+        }
+
+        return result;
+    }
+
     // Get campaign status
-    getCampaignStatus(campaignId) {
+    async getCampaignStatus(campaignId) {
         const queue = this.activeQueues.get(campaignId);
         const stats = this.sendingStats.get(campaignId);
-        const campaign = this.campaignManager.loadCampaign(campaignId);
+        const campaign = await this.campaignManager.loadCampaign(campaignId);
 
         if (!campaign) {
             return null;
@@ -433,14 +480,14 @@ class CampaignSender extends EventEmitter {
     }
 
     // Get all active campaigns
-    getActiveCampaigns() {
+    async getActiveCampaigns() {
         const active = [];
-        this.activeQueues.forEach((queue, campaignId) => {
-            const status = this.getCampaignStatus(campaignId);
+        for (const [campaignId] of this.activeQueues.entries()) {
+            const status = await this.getCampaignStatus(campaignId);
             if (status) {
                 active.push(status);
             }
-        });
+        }
         return active;
     }
 }

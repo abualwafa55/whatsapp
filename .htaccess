@@ -2,12 +2,17 @@
 <IfModule mod_rewrite.c>
     RewriteEngine On
     
+    # WebSocket upgrade handling - MUST come first
+    RewriteCond %{HTTP:Upgrade} websocket [NC]
+    RewriteCond %{HTTP:Connection} upgrade [NC]
+    RewriteRule ^(.*)$ ws://127.0.0.1:3100/$1 [P,L]
+    
     # Exclude static files from being proxied
     RewriteCond %{REQUEST_URI} !^/media/
     RewriteCond %{REQUEST_URI} !^/admin/js/
     
     # Proxy all other requests to Node.js app
-    RewriteRule ^(.*)$ http://localhost:3000/$1 [P,L]
+    RewriteRule ^(.*)$ http://127.0.0.1:3100/$1 [P,L]
 </IfModule>
 
 # Security Headers

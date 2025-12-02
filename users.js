@@ -1,206 +1,285 @@
 const bcrypt = require('./bcrypt-compat');
-const fs = require('fs').promises;
+const prisma = require('./prismaClient');
+const { UserRole, SessionStatus } = require('@prisma/client');
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
 class UserManager {
     constructor(encryptionKey) {
-        this.usersFile = path.join(__dirname, 'users.enc');
         this.encryptionKey = encryptionKey;
-        this.users = new Map();
-        this.loadUsers();
+        this.legacyFile = path.join(__dirname, 'users.enc');
+        this.migrationPromise = this.migrateFromLegacyFile();
     }
 
-    // Encryption/decryption methods
+    async ensureReady() {
+        if (this.migrationPromise) {
+            await this.migrationPromise;
+            this.migrationPromise = null;
+        }
+    }
+
+    normalizeRole(role = 'user') {
+        return role && role.toString().toLowerCase() === 'admin' ? UserRole.ADMIN : UserRole.USER;
+    }
+
+    presentRole(role) {
+        return role === UserRole.ADMIN ? 'admin' : 'user';
+    }
+
+    async migrateFromLegacyFile() {
+        if (!this.encryptionKey || !fs.existsSync(this.legacyFile)) {
+            return;
+        }
+
+        try {
+            const encryptedData = fs.readFileSync(this.legacyFile, 'utf8');
+            if (!encryptedData) {
+                return;
+            }
+            const decryptedData = this.decrypt(encryptedData);
+            const legacyUsers = JSON.parse(decryptedData);
+
+            for (const legacyUser of legacyUsers) {
+                const email = (legacyUser.email || '').toLowerCase();
+                if (!email) continue;
+
+                await prisma.user.upsert({
+                    where: { email },
+                    update: {
+                        passwordHash: legacyUser.password,
+                        role: this.normalizeRole(legacyUser.role),
+                        isActive: legacyUser.isActive !== false,
+                        createdBy: legacyUser.createdBy || 'migration',
+                        lastLogin: legacyUser.lastLogin ? new Date(legacyUser.lastLogin) : null
+                    },
+                    create: {
+                        email,
+                        passwordHash: legacyUser.password,
+                        role: this.normalizeRole(legacyUser.role),
+                        createdBy: legacyUser.createdBy || 'migration',
+                        isActive: legacyUser.isActive !== false,
+                        lastLogin: legacyUser.lastLogin ? new Date(legacyUser.lastLogin) : null
+                    }
+                });
+
+                if (Array.isArray(legacyUser.sessions)) {
+                    for (const sessionId of legacyUser.sessions) {
+                        if (!sessionId) continue;
+                        await prisma.session.upsert({
+                            where: { id: sessionId },
+                            update: {
+                                owner: { connect: { email } }
+                            },
+                            create: {
+                                id: sessionId,
+                                name: sessionId,
+                                status: SessionStatus.CREATING,
+                                owner: { connect: { email } }
+                            }
+                        });
+                    }
+                }
+            }
+
+            fs.renameSync(this.legacyFile, `${this.legacyFile}.bak`);
+            console.log('✅ Migrated legacy users.enc into the database. Backup saved as users.enc.bak');
+        } catch (error) {
+            console.error('⚠️  Failed to migrate legacy users.enc file:', error.message);
+        }
+    }
+
     encrypt(text) {
         const algorithm = 'aes-256-cbc';
         const key = Buffer.from(this.encryptionKey.slice(0, 64), 'hex');
         const iv = crypto.randomBytes(16);
-        
+
         const cipher = crypto.createCipheriv(algorithm, key, iv);
         let encrypted = cipher.update(text, 'utf8', 'hex');
         encrypted += cipher.final('hex');
-        
+
         return iv.toString('hex') + ':' + encrypted;
     }
 
     decrypt(text) {
         const algorithm = 'aes-256-cbc';
         const key = Buffer.from(this.encryptionKey.slice(0, 64), 'hex');
-        
+
         const parts = text.split(':');
         const iv = Buffer.from(parts[0], 'hex');
         const encryptedText = parts[1];
-        
+
         const decipher = crypto.createDecipheriv(algorithm, key, iv);
         let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
         decrypted += decipher.final('utf8');
-        
+
         return decrypted;
     }
 
-    async loadUsers() {
-        try {
-            const encryptedData = await fs.readFile(this.usersFile, 'utf8');
-            const decryptedData = this.decrypt(encryptedData);
-            const userData = JSON.parse(decryptedData);
-            
-            this.users = new Map(userData.map(user => [user.email, user]));
-        } catch (error) {
-            // File doesn't exist or is corrupted, start fresh
-            this.users = new Map();
-            
-            // Create default admin user if no users exist
-            if (this.users.size === 0 && process.env.ADMIN_DASHBOARD_PASSWORD) {
-                await this.createUser({
-                    email: 'admin@localhost',
-                    password: process.env.ADMIN_DASHBOARD_PASSWORD,
-                    role: 'admin',
-                    createdBy: 'system'
-                });
-            }
+    toPublicUser(user) {
+        if (!user) return null;
+        const { passwordHash, ...safeUser } = user;
+        let sessionIds = [];
+        if (Array.isArray(user.sessions)) {
+            sessionIds = user.sessions.map((session) =>
+                typeof session === 'string' ? session : session.id
+            );
         }
-    }
-
-    async saveUsers() {
-        const userData = Array.from(this.users.values());
-        const jsonData = JSON.stringify(userData, null, 2);
-        const encryptedData = this.encrypt(jsonData);
-        
-        await fs.writeFile(this.usersFile, encryptedData);
+        return {
+            ...safeUser,
+            role: this.presentRole(user.role),
+            sessions: sessionIds
+        };
     }
 
     async createUser({ email, password, role = 'user', createdBy }) {
-        if (this.users.has(email)) {
+        await this.ensureReady();
+        const normalizedEmail = email.toLowerCase();
+        const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+        if (existing) {
             throw new Error('User already exists');
         }
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        const user = {
-            id: crypto.randomUUID(),
-            email: email.toLowerCase(),
-            password: hashedPassword,
-            role,
-            createdBy,
-            createdAt: new Date().toISOString(),
-            sessions: [], // WhatsApp sessions created by this user
-            lastLogin: null,
-            isActive: true
-        };
+        const user = await prisma.user.create({
+            data: {
+                email: normalizedEmail,
+                passwordHash: hashedPassword,
+                role: this.normalizeRole(role),
+                createdBy,
+                isActive: true
+            },
+            include: { sessions: { select: { id: true } } }
+        });
 
-        this.users.set(email.toLowerCase(), user);
-        await this.saveUsers();
-        
-        // Return user without password
-        const { password: _, ...userWithoutPassword } = user;
-        return userWithoutPassword;
+        return this.toPublicUser(user);
     }
 
     async updateUser(email, updates) {
-        const user = this.users.get(email.toLowerCase());
-        if (!user) {
-            throw new Error('User not found');
-        }
+        await this.ensureReady();
+        const normalizedEmail = email.toLowerCase();
+        const data = {};
 
-        // Don't allow updating certain fields
-        delete updates.id;
-        delete updates.email;
-        delete updates.createdBy;
-        delete updates.createdAt;
-
-        // Hash password if being updated
         if (updates.password) {
-            updates.password = await bcrypt.hash(updates.password, 10);
+            data.passwordHash = await bcrypt.hash(updates.password, 10);
+        }
+        if (typeof updates.isActive === 'boolean') {
+            data.isActive = updates.isActive;
+        }
+        if (updates.role) {
+            data.role = this.normalizeRole(updates.role);
         }
 
-        Object.assign(user, updates);
-        await this.saveUsers();
-        
-        const { password: _, ...userWithoutPassword } = user;
-        return userWithoutPassword;
+        const user = await prisma.user.update({
+            where: { email: normalizedEmail },
+            data,
+            include: { sessions: { select: { id: true } } }
+        });
+
+        return this.toPublicUser(user);
     }
 
     async deleteUser(email) {
-        if (!this.users.has(email.toLowerCase())) {
-            throw new Error('User not found');
-        }
-
-        this.users.delete(email.toLowerCase());
-        await this.saveUsers();
+        await this.ensureReady();
+        const normalizedEmail = email.toLowerCase();
+        await prisma.user.delete({ where: { email: normalizedEmail } });
         return { success: true };
     }
 
     async authenticateUser(email, password) {
-        const user = this.users.get(email.toLowerCase());
+        await this.ensureReady();
+        const normalizedEmail = email.toLowerCase();
+        const user = await prisma.user.findUnique({ where: { email: normalizedEmail } });
         if (!user || !user.isActive) {
             return null;
         }
 
-        const isValid = await bcrypt.compare(password, user.password);
+        const isValid = await bcrypt.compare(password, user.passwordHash);
         if (!isValid) {
             return null;
         }
 
-        // Update last login
-        user.lastLogin = new Date().toISOString();
-        await this.saveUsers();
+        const updated = await prisma.user.update({
+            where: { email: normalizedEmail },
+            data: { lastLogin: new Date() },
+            include: { sessions: { select: { id: true } } }
+        });
 
-        const { password: _, ...userWithoutPassword } = user;
-        return userWithoutPassword;
+        return this.toPublicUser(updated);
     }
 
-    getUser(email) {
-        const user = this.users.get(email.toLowerCase());
-        if (!user) return null;
-        
-        const { password: _, ...userWithoutPassword } = user;
-        return userWithoutPassword;
+    async getUser(email) {
+        await this.ensureReady();
+        const normalizedEmail = email.toLowerCase();
+        const user = await prisma.user.findUnique({
+            where: { email: normalizedEmail },
+            include: { sessions: { select: { id: true } } }
+        });
+        return this.toPublicUser(user);
     }
 
-    getAllUsers() {
-        return Array.from(this.users.values()).map(user => {
-            const { password: _, ...userWithoutPassword } = user;
-            return userWithoutPassword;
+    async getAllUsers() {
+        await this.ensureReady();
+        const users = await prisma.user.findMany({
+            orderBy: { createdAt: 'desc' },
+            include: { sessions: { select: { id: true } } }
+        });
+        return users.map((user) => this.toPublicUser(user));
+    }
+
+    async addSessionToUser(email, sessionId) {
+        await this.ensureReady();
+        const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+        if (!user) {
+            throw new Error('User not found');
+        }
+
+        await prisma.session.upsert({
+            where: { id: sessionId },
+            update: {
+                ownerId: user.id
+            },
+            create: {
+                id: sessionId,
+                name: sessionId,
+                status: SessionStatus.CREATING,
+                ownerId: user.id
+            }
         });
     }
 
-    // Session ownership methods
-    async addSessionToUser(email, sessionId) {
-        const user = this.users.get(email.toLowerCase());
-        if (!user) {
-            throw new Error('User not found');
-        }
-
-        if (!user.sessions.includes(sessionId)) {
-            user.sessions.push(sessionId);
-            await this.saveUsers();
-        }
-    }
-
     async removeSessionFromUser(email, sessionId) {
-        const user = this.users.get(email.toLowerCase());
-        if (!user) {
-            throw new Error('User not found');
+        await this.ensureReady();
+        const session = await prisma.session.findUnique({ where: { id: sessionId } });
+        if (!session) {
+            return;
         }
-
-        user.sessions = user.sessions.filter(id => id !== sessionId);
-        await this.saveUsers();
+        await prisma.session.update({
+            where: { id: sessionId },
+            data: { ownerId: null }
+        });
     }
 
-    getUserSessions(email) {
-        const user = this.users.get(email.toLowerCase());
-        return user ? user.sessions : [];
+    async getUserSessions(email) {
+        await this.ensureReady();
+        const user = await prisma.user.findUnique({
+            where: { email: email.toLowerCase() },
+            include: { sessions: { select: { id: true } } }
+        });
+        return user && user.sessions ? user.sessions.map((session) => session.id) : [];
     }
 
-    getSessionOwner(sessionId) {
-        for (const user of this.users.values()) {
-            if (user.sessions.includes(sessionId)) {
-                const { password: _, ...userWithoutPassword } = user;
-                return userWithoutPassword;
-            }
+    async getSessionOwner(sessionId) {
+        await this.ensureReady();
+        const session = await prisma.session.findUnique({
+            where: { id: sessionId },
+            include: { owner: true }
+        });
+        if (!session || !session.owner) {
+            return null;
         }
-        return null;
+        return this.toPublicUser({ ...session.owner, sessions: [] });
     }
 }
 
-module.exports = UserManager; 
+module.exports = UserManager;
